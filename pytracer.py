@@ -1,17 +1,20 @@
 #!/usr/bin/env python
+import asyncio
 import argparse
 import socket
 import struct
 import sys
 import time
 
-def dns_check(host):
+async def dns_check(host):
     """
     Performs a DNS lookup for the given host.
     Returns the IP address if successful, None otherwise.
     """
     try:
-        ip_address = socket.gethostbyname(host)
+        loop = asyncio.get_running_loop()
+        addr_info = await loop.getaddrinfo(host, None)
+        ip_address = addr_info[0][4][0]
         if args.verbose:
             print(f"DNS lookup for {host}: {ip_address}")
         return ip_address
@@ -95,39 +98,44 @@ def create_ip_tcp_packet(source_ip, dest_ip, dest_port, ttl):
 
     return packet, source_port
 
-def test_proxy_connection(dest_host, dest_port, proxy_host, proxy_port, timeout):
+async def test_proxy_connection(dest_host, dest_port, proxy_host, proxy_port, timeout):
     """
     Tests the connection to the destination through an HTTP proxy.
     """
     print(f"Testing connection to {dest_host}:{dest_port} through proxy {proxy_host}:{proxy_port}")
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(timeout)
-        s.connect((proxy_host, proxy_port))
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(proxy_host, proxy_port),
+            timeout=timeout
+        )
 
         connect_request = f"CONNECT {dest_host}:{dest_port} HTTP/1.1\r\nHost: {dest_host}:{dest_port}\r\n\r\n"
+        writer.write(connect_request.encode())
+        await writer.drain()
 
-        s.sendall(connect_request.encode())
-        
-        response = s.recv(1024).decode()
-        
+        response = await asyncio.wait_for(reader.read(1024), timeout=timeout)
+        response = response.decode()
+
         if args.verbose:
             print("Proxy response:")
             print(response)
-            
+
         if "200 OK" in response or "200 Connection established" in response:
             print("Connection through proxy successful.")
         else:
             print("Proxy connection failed.")
 
-    except socket.timeout:
+    except asyncio.TimeoutError:
         print("Proxy connection timed out.")
     except Exception as e:
         print(f"An error occurred: {e}")
     finally:
-        s.close()
+        if 'writer' in locals() and writer:
+            writer.close()
+            await writer.wait_closed()
 
-def main():
+async def main():
+    loop = asyncio.get_running_loop()
     if sys.platform == "win32":
         import ctypes
         if not ctypes.windll.shell32.IsUserAnAdmin():
@@ -148,23 +156,25 @@ def main():
         try:
             proxy_host, proxy_port = args.proxy.split(":")
             proxy_port = int(proxy_port)
-            test_proxy_connection(args.host, args.port, proxy_host, proxy_port, args.timeout)
+            await test_proxy_connection(args.host, args.port, proxy_host, proxy_port, args.timeout)
             sys.exit(0)
         except ValueError:
             print("Error: Invalid proxy format. Please use host:port.")
             sys.exit(1)
 
-    dest_ip = dns_check(args.host)
+    dest_ip = await dns_check(args.host)
     if not dest_ip:
         sys.exit(1)
 
     print(f"Tracing route to {args.host} [{dest_ip}] over a maximum of {args.max_hops} hops:")
 
-    source_ip = socket.gethostbyname(socket.gethostname())
+    addr_infos = await loop.getaddrinfo(socket.gethostname(), None)
+    source_ip = [info[4][0] for info in addr_infos if info[0] == socket.AF_INET][0]
 
     for ttl in range(1, args.max_hops + 1):
+        loop = asyncio.get_running_loop()
         recv_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
-        recv_socket.settimeout(args.timeout)
+        recv_socket.setblocking(False)
         try:
             recv_socket.bind(("", 0))
         except OSError as e:
@@ -175,14 +185,15 @@ def main():
 
         send_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
         send_socket.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+        send_socket.setblocking(False)
 
         packet, source_port = create_ip_tcp_packet(source_ip, dest_ip, args.port, ttl)
 
         try:
-            send_socket.sendto(packet, (dest_ip, args.port))
+            await loop.sock_sendto(send_socket, packet, (dest_ip, args.port))
             start_time = time.time()
 
-            data, addr = recv_socket.recvfrom(1024)
+            data, addr = await asyncio.wait_for(loop.sock_recvfrom(recv_socket, 1024), timeout=args.timeout)
             end_time = time.time()
 
             icmp_header = data[20:28]
@@ -199,24 +210,27 @@ def main():
                 print(f"{ttl:2d}  {addr[0]:<15}  {elapsed_time:.2f} ms (Destination Unreachable)")
                 break
             
-        except socket.timeout:
-            check_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            check_socket.settimeout(0.1)
+        except asyncio.TimeoutError:
+            # In case of a timeout, we can't be sure if the destination is reached.
+            # We can try to connect to the port to see if it's open.
             try:
-                check_socket.connect((dest_ip, args.port))
+                _, writer = await asyncio.wait_for(
+                    asyncio.open_connection(dest_ip, args.port),
+                    timeout=0.1
+                )
                 end_time = time.time()
                 elapsed_time = (end_time - start_time) * 1000
                 print(f"{ttl:2d}  {dest_ip:<15}  {elapsed_time:.2f} ms (Destination Reached)")
-                check_socket.close()
+                writer.close()
+                await writer.wait_closed()
                 break
-            except (socket.timeout, ConnectionRefusedError):
+            except (asyncio.TimeoutError, ConnectionRefusedError):
                 print(f"{ttl:2d}  {'*':<15}")
-            finally:
-                check_socket.close()
 
         finally:
             recv_socket.close()
             send_socket.close()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
+
