@@ -13,7 +13,7 @@ A simple command-line tool for performing TCP traceroutes and testing proxy conn
 ### Traceroute
 
 ```bash
-python pytracer.py <host> [options]
+python -m pytracer.main <host> [options]
 ```
 
 **Options:**
@@ -26,17 +26,25 @@ python pytracer.py <host> [options]
 **Example:**
 
 ```bash
-python pytracer.py google.com -p 443
+python -m pytracer.main google.com -p 443
 ```
 
 ### Proxy Test
 
 ```bash
-python pytracer.py <host> --proxy <proxy_host>:<proxy_port> [options]
+python -m pytracer.main <host> --proxy <proxy_host>:<proxy_port> [options]
 ```
 
 **Example:**
 
 ```bash
-python pytracer.py google.com --proxy 127.0.0.1:8080
+python -m pytracer.main google.com --proxy 127.0.0.1:8080
+```
+
+## Running Tests
+
+To run the test suite, use the following command:
+
+```bash
+python -m unittest discover tests
 ```
